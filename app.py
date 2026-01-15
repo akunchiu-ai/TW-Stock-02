@@ -147,4 +147,126 @@ def get_top_volume_stocks(limit=500):
 # 3. 第三步：策略邏輯 (針對 Top 500 進行詳細分析)
 # ==========================================
 def check_dream_strategy(row_data, strict_mode=True):
-    full_ticker = row_data['full_ticker
+    full_ticker = row_data['full_ticker']
+    
+    try:
+        # 下載歷史資料 (需 1 年以計算 MA200)
+        df = yf.download(full_ticker, period="1y", progress=False)
+        
+        if len(df) < 205: return None
+        
+        close = df['Close'].squeeze()
+        volume = df['Volume'].squeeze()
+        curr_price = close.iloc[-1]
+        
+        # --- 計算均線 ---
+        ma5 = close.rolling(5).mean().iloc[-1]
+        ma20 = close.rolling(20).mean().iloc[-1]
+        ma60 = close.rolling(60).mean().iloc[-1]
+        ma120 = close.rolling(120).mean().iloc[-1]
+        
+        ma200_series = close.rolling(200).mean()
+        c_ma200 = ma200_series.iloc[-1]
+        
+        vol_ma20_series = volume.rolling(20).mean()
+        
+        # --- 條件 1: 均線多頭排列 ---
+        cond_price = (curr_price > ma5) and (curr_price > ma20) and \
+                     (curr_price > ma60) and (curr_price > ma120)
+        
+        if not cond_price: return None
+        
+        # --- 條件 2: 乖離率 < 30 ---
+        bias_val = ((ma5 - c_ma200) / c_ma200) * 100
+        cond_bias = bias_val < 30
+        
+        # --- 條件 3: 趨勢判斷 ---
+        segment_len = 10
+        if strict_mode:
+            # 嚴格：連續10天 Diff > 0
+            cond_ma200 = ma200_series.iloc[-(segment_len+1):].diff().dropna().gt(0).all()
+            cond_vol = vol_ma20_series.iloc[-(segment_len+1):].diff().dropna().gt(0).all()
+        else:
+            # 寬鬆：目前 > 10天前
+            cond_ma200 = ma200_series.iloc[-1] > ma200_series.iloc[-(segment_len+1)]
+            cond_vol = vol_ma20_series.iloc[-1] > vol_ma20_series.iloc[-(segment_len+1)]
+
+        if cond_bias and cond_ma200 and cond_vol:
+            return {
+                "代號": row_data['ticker'],
+                "名稱": row_data['name'], # 這裡會顯示個股名稱
+                "現價": row_data['price_now'],
+                "成交量": row_data['volume'],
+                "乖離率": f"{bias_val:.2f}%",
+                "趨勢": "🔥強勢" if strict_mode else "📈向上"
+            }
+            
+    except Exception:
+        return None
+    return None
+
+# ==========================================
+# 4. UI 介面
+# ==========================================
+st.title("🚀 夢想起飛：全市場動態篩選")
+st.markdown("### 資料來源：全台 1800+ 檔上市櫃股票動態掃描")
+st.caption("流程：1. 抓取所有股票代號 -> 2. yfinance 計算成交量 -> 3. 鎖定前 500 大 -> 4. 策略篩選")
+
+with st.sidebar:
+    st.header("⚙️ 設定")
+    # 這裡改成鎖定前 500 大
+    scan_limit = st.slider("鎖定成交量前 N 大進行分析", 100, 500, 300) 
+    strict_mode = st.checkbox("嚴格模式 (連續10日上升)", value=False)
+    st.info("💡 建議：先用 300 檔測試速度，若需要更廣範圍再開到 500。")
+
+if st.button("開始掃描 (需耗時約 1-2 分鐘)", type="primary"):
+    
+    with st.status("正在啟動全市場掃描引擎...", expanded=True) as status:
+        
+        # 步驟 1 & 2
+        st.write("📡 正在取得全台股票清單並計算成交量 (yfinance)...")
+        df_hot = get_top_volume_stocks(limit=scan_limit)
+        
+        if df_hot.empty:
+            status.update(label="❌ 數據取得失敗", state="error")
+            st.error("無法取得市場數據，請稍後再試。")
+            st.stop()
+            
+        st.write(f"✅ 已鎖定成交量最大的 {len(df_hot)} 檔熱門股 (如: {df_hot.iloc[0]['name']})，開始策略分析...")
+        
+        # 步驟 3
+        results = []
+        progress_bar = st.progress(0)
+        
+        # 使用 enumerate 確保進度條正常
+        for i, (index, row) in enumerate(df_hot.iterrows()):
+            
+            # 安全計算進度
+            progress_val = min((i + 1) / len(df_hot), 1.0)
+            progress_bar.progress(progress_val)
+            
+            res = check_dream_strategy(row, strict_mode)
+            if res:
+                results.append(res)
+        
+        status.update(label="全市場掃描完成！", state="complete", expanded=False)
+
+    # 步驟 4: 顯示結果
+    if results:
+        final_df = pd.DataFrame(results)
+        final_df = final_df.sort_values(by="成交量", ascending=False)
+        
+        st.success(f"🎉 從前 {scan_limit} 大熱門股中，篩選出 {len(final_df)} 檔符合條件！")
+        
+        st.dataframe(
+            final_df,
+            column_config={
+                "現價": st.column_config.NumberColumn(format="$%.2f"),
+                "成交量": st.column_config.NumberColumn(format="%d 張"), # 顯示張數
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.warning("🧐 掃描完畢，沒有股票符合條件。")
+        st.markdown("**建議：** 你的策略非常嚴格，建議關閉「嚴格模式」或檢查目前市場是否處於回檔期。")
