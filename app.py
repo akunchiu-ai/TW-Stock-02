@@ -7,8 +7,6 @@ st.set_page_config(page_title="夢想起飛：全市場掃描", layout="wide")
 
 # ==========================================
 # 1. 定義「台股宇宙」 (Top 300 權值與熱門股)
-#    既然無法爬排行榜，我們直接掃描全市場最重要的股票
-#    這份清單涵蓋了 0050, 0051, 0056 成分股與所有熱門題材
 # ==========================================
 STOCK_UNIVERSE = [
     # 半導體/AI
@@ -42,33 +40,25 @@ STOCK_UNIVERSE = [
 # ==========================================
 @st.cache_data(ttl=600)  # 快取 10 分鐘
 def get_sorted_market_data(limit=100):
-    """
-    一次下載所有名單的數據，然後依成交量排序
-    """
     try:
-        # 使用 yfinance 批量下載 (這是合法的 API 用法，不會被擋)
-        # 我們只抓最近 5 天資料來判斷成交量
+        # 使用 yfinance 批量下載
         data = yf.download(STOCK_UNIVERSE, period="5d", group_by='ticker', progress=False)
         
         if data.empty: return pd.DataFrame()
 
         snapshot = []
         
-        # 遍歷下載回來的資料
         for ticker in STOCK_UNIVERSE:
             try:
-                # 檢查這個代號是否有資料
                 if ticker not in data.columns.levels[0]: continue
                 
                 df_stock = data[ticker]
                 if df_stock.empty: continue
                 
-                # 取得最新一筆
                 latest = df_stock.iloc[-1]
                 vol = latest['Volume']
                 price = latest['Close']
                 
-                # 若成交量是 NaN 或 0 則跳過
                 if pd.isna(vol) or vol == 0: continue
                 
                 snapshot.append({
@@ -80,12 +70,11 @@ def get_sorted_market_data(limit=100):
             except:
                 continue
         
-        # 轉成 DataFrame 並排序
         df_all = pd.DataFrame(snapshot)
         
         if df_all.empty: return pd.DataFrame()
         
-        # 依成交量由大到小排序，取前 N 名
+        # 排序後，這裡的索引(Index)會變亂，例如 [5, 23, 1...]
         df_sorted = df_all.sort_values(by="volume", ascending=False).head(limit)
         
         return df_sorted
@@ -101,7 +90,6 @@ def check_dream_strategy(row_data, strict_mode=True):
     full_ticker = row_data['full_ticker']
     
     try:
-        # 下載單檔長天期資料 (用於技術分析)
         df = yf.download(full_ticker, period="1y", progress=False)
         
         if len(df) < 205: return None
@@ -121,24 +109,20 @@ def check_dream_strategy(row_data, strict_mode=True):
         
         vol_ma20_series = volume.rolling(20).mean()
         
-        # --- 條件 1: 均線多頭 ---
+        # --- 條件 ---
         cond_price = (curr_price > ma5) and (curr_price > ma20) and \
                      (curr_price > ma60) and (curr_price > ma120)
         
         if not cond_price: return None
         
-        # --- 條件 2: 乖離率 < 30 ---
         bias_val = ((ma5 - c_ma200) / c_ma200) * 100
         cond_bias = bias_val < 30
         
-        # --- 條件 3: 趨勢判斷 ---
         segment_len = 10
         if strict_mode:
-            # 嚴格：連續10天每天都漲
             cond_ma200 = ma200_series.iloc[-(segment_len+1):].diff().dropna().gt(0).all()
             cond_vol = vol_ma20_series.iloc[-(segment_len+1):].diff().dropna().gt(0).all()
         else:
-            # 寬鬆：現在比10天前高
             cond_ma200 = ma200_series.iloc[-1] > ma200_series.iloc[-(segment_len+1)]
             cond_vol = vol_ma20_series.iloc[-1] > vol_ma20_series.iloc[-(segment_len+1)]
 
@@ -170,7 +154,6 @@ with st.sidebar:
 
 if st.button("開始執行選股", type="primary"):
     
-    # 步驟 1: 取得並排序資料
     with st.status("正在連線至市場數據...", expanded=True) as status:
         st.write("📡 正在批量下載台股報價...")
         
@@ -183,19 +166,24 @@ if st.button("開始執行選股", type="primary"):
             
         st.write(f"✅ 成功取得成交量前 {len(df_hot)} 名股票，開始分析...")
         
-        # 步驟 2: 執行策略
         results = []
         progress_bar = st.progress(0)
         
-        for i, row in df_hot.iterrows():
-            progress_bar.progress((i + 1) / len(df_hot))
+        # --- 修正重點在這裡 ---
+        # 使用 enumerate 強制取得新的計數器 i (0, 1, 2...)
+        # 同時取得 row (資料)
+        for i, (index, row) in enumerate(df_hot.iterrows()):
+            
+            # 計算進度百分比 (確保不超過 1.0)
+            progress_val = min((i + 1) / len(df_hot), 1.0)
+            progress_bar.progress(progress_val)
+            
             res = check_dream_strategy(row, strict_mode)
             if res:
                 results.append(res)
         
         status.update(label="分析完成！", state="complete", expanded=False)
 
-    # 步驟 3: 顯示結果
     if results:
         final_df = pd.DataFrame(results)
         final_df = final_df.sort_values(by="成交量", ascending=False)
@@ -213,4 +201,4 @@ if st.button("開始執行選股", type="primary"):
         )
     else:
         st.warning("🧐 掃描完畢，沒有股票符合條件。")
-        st.markdown("**建議：** 嘗試關閉「嚴格模式」再試一次，因為「連續10天每天上漲」是非常罕見的條件。")
+        st.markdown("**建議：** 嘗試關閉「嚴格模式」再試一次。")
