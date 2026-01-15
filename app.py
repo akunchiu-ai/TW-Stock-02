@@ -2,86 +2,101 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 import requests
-import datetime
 
 # 設定頁面
 st.set_page_config(page_title="夢想起飛：上市櫃全掃描", layout="wide")
 
-# --- 1. 爬蟲功能：抓取上市與上櫃熱門股 ---
-# --- 1. 爬蟲功能：改用 HiStock (結構較穩定) ---
+# --- 0. 內建備用熱門股清單 (救生圈) ---
+# 當爬蟲失效時，自動使用這份清單，確保 APP 能運作
+FALLBACK_STOCKS = [
+    # 上市熱門 (電子/航運/AI/重電)
+    "2330.TW", "2317.TW", "2454.TW", "2303.TW", "2308.TW", "2382.TW", "3231.TW", "2357.TW", "2376.TW", "2356.TW",
+    "2603.TW", "2609.TW", "2615.TW", "2618.TW", "2610.TW", "2605.TW", "2606.TW",
+    "3037.TW", "3035.TW", "3017.TW", "3481.TW", "2409.TW", "2481.TW", "2408.TW",
+    "1513.TW", "1519.TW", "1504.TW", "1514.TW", "1609.TW", "1605.TW",
+    "2891.TW", "2881.TW", "2882.TW", "2886.TW", "2892.TW", "2884.TW", "2890.TW", "2885.TW", "2880.TW", "2883.TW",
+    "1101.TW", "1605.TW", "2002.TW", "2324.TW", "2353.TW", "2354.TW", "2368.TW", "2379.TW", "2383.TW", "2385.TW",
+    "2449.TW", "2498.TW", "2515.TW", "3008.TW", "3034.TW", "3044.TW", "3189.TW", "3231.TW", "3443.TW", "3532.TW",
+    "3661.TW", "3711.TW", "4938.TW", "5871.TW", "5876.TW", "6239.TW", "6669.TW", "8046.TW", "9904.TW", "9945.TW",
+    "3019.TW", "2421.TW", "2363.TW", "8210.TW", "3653.TW", "6285.TW", "2344.TW", "3583.TW", "6176.TW", "2313.TW",
+    
+    # 上櫃熱門 (生技/半導體/光電)
+    "8069.TWO", "5347.TWO", "6180.TWO", "3293.TWO", "3105.TWO", "3324.TWO", "3374.TWO", "3529.TWO", "3264.TWO",
+    "3548.TWO", "3680.TWO", "3693.TWO", "4105.TWO", "4114.TWO", "4128.TWO", "4162.TWO", "4743.TWO", "4966.TWO",
+    "4979.TWO", "5009.TWO", "5274.TWO", "5371.TWO", "5483.TWO", "6121.TWO", "6138.TWO", "6147.TWO", "6182.TWO",
+    "6217.TWO", "6223.TWO", "6274.TWO", "6446.TWO", "6472.TWO", "6488.TWO", "6547.TWO", "6589.TWO", "8044.TWO",
+    "8086.TWO", "8255.TWO", "8299.TWO", "8358.TWO", "8936.TWO", "8050.TWO", "6104.TWO", "3363.TWO", "3141.TWO"
+]
+
+# --- 1. 爬蟲功能 (含自動備援機制) ---
 @st.cache_data(ttl=3600)
-def get_hot_stocks_from_web(limit=100):
+def get_hot_stocks_smart(limit=100):
     """
-    從 HiStock 嗨投資爬取上市與上櫃的成交量排行
+    嘗試抓取網路排行，若失敗則回傳內建備用清單
     """
+    # 嘗試抓取 (HiStock)
     try:
-        # 定義目標網址 (HiStock 的網址結構比較適合爬蟲)
-        # m=tw (上市), m=otc (上櫃)
-        sources = [
-            {"url": "https://histock.tw/stock/rank.aspx?m=tw", "suffix": ".TW", "market": "上市"},
-            {"url": "https://histock.tw/stock/rank.aspx?m=otc", "suffix": ".TWO", "market": "上櫃"}
-        ]
+        url_tw = "https://histock.tw/stock/rank.aspx?m=tw"
+        url_two = "https://histock.tw/stock/rank.aspx?m=otc"
         
         all_stocks = []
-
-        for source in sources:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-            }
-            response = requests.get(source["url"], headers=headers)
-            # 強制設定編碼，避免亂碼
-            response.encoding = 'utf-8'
-            
-            # 讀取表格
-            dfs = pd.read_html(response.text)
-            
-            # HiStock 的排行榜通常是頁面中的第一個表格
-            if dfs:
-                target_df = dfs[0]
-                
-                # 檢查欄位，確保有 '代號' 和 '成交量'
-                # HiStock 欄位通常是: 排名, 代號, 名稱, ..., 成交量
-                if '代號' in target_df.columns and '成交量' in target_df.columns:
-                    for index, row in target_df.iterrows():
-                        ticker = str(row['代號'])
-                        # 移除可能的特殊符號
-                        ticker = ''.join(filter(str.isdigit, ticker))
+        headers = {'User-Agent': 'Mozilla/5.0'} # 簡單 Header
+        
+        for url, suffix, market in [(url_tw, ".TW", "上市"), (url_two, ".TWO", "上櫃")]:
+            try:
+                dfs = pd.read_html(url, encoding='utf-8', header=0)
+                if dfs:
+                    df = dfs[0]
+                    # 尋找代號欄位
+                    col_code = [c for c in df.columns if "代號" in c][0]
+                    col_vol = [c for c in df.columns if "成交量" in c][0]
+                    
+                    for i, row in df.iterrows():
+                        code = str(row[col_code]).replace("'", "").strip()
+                        # 處理代號，只留數字
+                        code = ''.join(filter(str.isdigit, code))
+                        if not code: continue
                         
-                        if not ticker: continue
-
-                        full_ticker = f"{ticker}{source['suffix']}"
+                        full_ticker = f"{code}{suffix}"
                         
-                        # 處理成交量 (有些人可能用 k 或 m 表示，但 HiStock 通常是純數字或逗號)
-                        vol_raw = str(row['成交量'])
-                        # 移除非數字字符 (除了 .)
+                        # 處理成交量
+                        vol = 0
                         try:
-                            volume = int(float(vol_raw.replace(',', '')))
+                            vol = int(str(row[col_vol]).replace(',', ''))
                         except:
-                            volume = 0
-
+                            vol = 0
+                            
                         all_stocks.append({
-                            "ticker": ticker,
+                            "ticker": code,
                             "full_ticker": full_ticker,
-                            "market": source['market'],
-                            "volume": volume
+                            "market": market,
+                            "volume": vol
                         })
+            except:
+                continue
 
-        # 將上市上櫃混合，依照成交量排序
-        df_all = pd.DataFrame(all_stocks)
-        
-        if df_all.empty:
-            return pd.DataFrame()
+        if len(all_stocks) > 10:
+            df_res = pd.DataFrame(all_stocks)
+            df_res = df_res.sort_values(by="volume", ascending=False).head(limit)
+            return df_res, "網路即時排行"
+            
+    except Exception:
+        pass
 
-        # 排序並取前 N 名
-        df_all = df_all.sort_values(by="volume", ascending=False).head(limit)
-        
-        return df_all
-        
-    except Exception as e:
-        # 在 Streamlit 介面印出錯誤以便除錯
-        print(f"爬蟲錯誤: {e}") 
-        st.error(f"抓取資料發生錯誤，可能是來源網站阻擋: {e}")
-        return pd.DataFrame()
+    # --- 如果上面失敗，執行這裡 (B計畫) ---
+    fallback_data = []
+    for ticker in FALLBACK_STOCKS:
+        code = ticker.split('.')[0]
+        mkt = "上市" if "TW" in ticker and "TWO" not in ticker else "上櫃"
+        fallback_data.append({
+            "ticker": code,
+            "full_ticker": ticker,
+            "market": mkt,
+            "volume": 0 # 備用清單無即時量，設為0
+        })
+    
+    return pd.DataFrame(fallback_data).head(limit), "⚠️ 內建熱門清單 (網路抓取受阻)"
+
 
 # --- 2. 策略邏輯 ---
 def check_strategy(row_data, strict_mode=True):
@@ -94,11 +109,10 @@ def check_strategy(row_data, strict_mode=True):
         
         if len(df) < 210: return None
         
-        # 處理資料 (去除 MultiIndex)
+        # 處理資料
         close = df['Close'].squeeze()
         volume = df['Volume'].squeeze()
         
-        # 取得當前值
         curr_price = close.iloc[-1]
         
         # 計算均線
@@ -107,41 +121,37 @@ def check_strategy(row_data, strict_mode=True):
         ma60 = close.rolling(60).mean().iloc[-1]
         ma120 = close.rolling(120).mean().iloc[-1]
         
-        # 計算 MA200 序列
+        # MA200 序列
         ma200_series = close.rolling(200).mean()
         c_ma200 = ma200_series.iloc[-1]
         
-        # 計算均量 20MA 序列
+        # 均量 20MA
         vol_ma20_series = volume.rolling(20).mean()
         
-        # --- 條件 1: 均線多頭 (價格 > 各均線) ---
+        # --- 條件 ---
+        # 1. 均線多頭
         cond_price = (curr_price > ma5) and (curr_price > ma20) and \
                      (curr_price > ma60) and (curr_price > ma120)
         
-        # --- 條件 2: (5,200) 乖離率 < 30 ---
-        # 乖離率公式: (MA5 - MA200) / MA200 * 100
+        # 2. 乖離率 (5,200) < 30
         bias_val = ((ma5 - c_ma200) / c_ma200) * 100
         cond_bias = bias_val < 30
         
-        # --- 條件 3 & 4: 趨勢判斷 (MA200 & 均量) ---
-        # 嚴格模式：連續 10 天數值上升
-        # 寬鬆模式：目前值 > 10天前的值 (整體趨勢向上)
-        
+        # 3 & 4. 趨勢判斷
         segment_len = 10
-        ma200_seg = ma200_series.iloc[-segment_len-1:]
-        vol_seg = vol_ma20_series.iloc[-segment_len-1:]
-        
         if strict_mode:
-            # diff() > 0 表示每天都比前一天大
+            ma200_seg = ma200_series.iloc[-segment_len-1:]
+            vol_seg = vol_ma20_series.iloc[-segment_len-1:]
             cond_ma200_trend = ma200_seg.diff().dropna().gt(0).all()
             cond_vol_trend = vol_seg.diff().dropna().gt(0).all()
         else:
-            # 寬鬆版：只看頭尾 (斜率為正)
             cond_ma200_trend = ma200_series.iloc[-1] > ma200_series.iloc[-11]
             cond_vol_trend = vol_ma20_series.iloc[-1] > vol_ma20_series.iloc[-11]
 
-        # 總結
         if cond_price and cond_bias and cond_ma200_trend and cond_vol_trend:
+            # 如果是備用清單，補上最新的成交量
+            display_vol = int(volume.iloc[-1])
+            
             return {
                 "股票代號": ticker,
                 "市場": row_data['market'],
@@ -149,70 +159,60 @@ def check_strategy(row_data, strict_mode=True):
                 "乖離率(%)": round(bias_val, 2),
                 "MA200趨勢": "連漲" if strict_mode else "向上",
                 "均量趨勢": "連漲" if strict_mode else "向上",
-                "當日成交量": int(row_data['volume'])
+                "成交量": display_vol
             }
         
-    except Exception as e:
+    except Exception:
         return None
     return None
 
 # --- 3. UI 介面 ---
-st.title("🚀 夢想起飛：上市櫃全掃描 APP")
+st.title("🚀 夢想起飛：上市櫃選股 APP")
 st.markdown("""
-**選股條件：**
-1. 收盤價 > MA5, MA20, MA60, MA120 (站上所有均線)
-2. (5, 200) 乖離率 < 30%
-3. MA200 (年線) 連續 10 日上升
-4. 20日均量 連續 10 日上升
+**選股條件：** 收盤 > MA5/20/60/120 且 (5,200)乖離 < 30% 且 MA200/均量趨勢向上
 """)
 
 col1, col2 = st.columns(2)
 with col1:
-    scan_limit = st.slider("掃描熱門股數量 (上市+上櫃)", 50, 300, 100)
+    scan_limit = st.slider("掃描股票數量", 50, 150, 100)
 with col2:
-    strict_mode = st.checkbox("開啟嚴格模式 (連續10日每日上升)", value=False, 
-                            help="若勾選，需連續10天每天數值都增加；若取消，僅需10天前到現在整體趨勢向上。建議取消以獲得更多結果。")
+    strict_mode = st.checkbox("嚴格模式 (每日上升)", value=False)
 
-if st.button("開始執行選股", type="primary"):
+if st.button("開始選股", type="primary"):
     
-    # 1. 抓取清單
-    with st.status("正在抓取上市櫃熱門股清單...", expanded=True) as status:
-        df_hot = get_hot_stocks_from_web(limit=scan_limit)
-        st.write(f"已取得 {len(df_hot)} 檔熱門股資料 (含上市與上櫃)")
+    with st.status("正在準備資料...", expanded=True) as status:
+        # 取得清單 (自動切換)
+        df_hot, source_name = get_hot_stocks_smart(limit=scan_limit)
         
-        if df_hot.empty:
-            st.error("無法抓取排行榜資料，請稍後再試。")
-            st.stop()
-            
-        # 2. 逐一分析
+        if "內建" in source_name:
+            st.warning(f"注意：無法抓取即時排行 (可能被阻擋)，已切換至「{source_name}」模式，分析約 150 檔權值熱門股。")
+        else:
+            st.info(f"成功取得：{source_name}")
+
+        status.update(label="正在計算技術指標 (約需 30-60 秒)...", state="running")
+        
         results = []
         progress_bar = st.progress(0)
-        status.update(label="正在計算技術指標...", state="running")
-        
         total_stocks = len(df_hot)
+        
         for i, row in df_hot.iterrows():
-            # 更新進度條
             progress_bar.progress((i + 1) / total_stocks)
-            
             res = check_strategy(row, strict_mode)
             if res:
                 results.append(res)
         
         status.update(label="分析完成！", state="complete", expanded=False)
 
-    # 3. 顯示結果
+    # 顯示結果
     if results:
         final_df = pd.DataFrame(results)
-        # 依成交量排序
-        final_df = final_df.sort_values(by="當日成交量", ascending=False)
+        final_df = final_df.sort_values(by="成交量", ascending=False)
         
-        st.success(f"🎉 成功篩選出 {len(final_df)} 檔潛力股！")
-        
-        # 美化顯示
+        st.success(f"🎉 找到 {len(final_df)} 檔符合條件的股票！")
         st.dataframe(
             final_df,
             column_config={
-                "當日成交量": st.column_config.NumberColumn(format="%d 張"),
+                "成交量": st.column_config.NumberColumn(format="%d 張"),
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
                 "乖離率(%)": st.column_config.NumberColumn(format="%.2f%%"),
             },
@@ -220,6 +220,4 @@ if st.button("開始執行選股", type="primary"):
             hide_index=True
         )
     else:
-        st.warning("🧐 掃描完畢，但沒有股票符合條件。")
-
-        st.info("建議：嘗試關閉「嚴格模式」或增加「掃描熱門股數量」。")
+        st.warning("🧐 掃描完畢，沒有股票符合條件。建議關閉「嚴格模式」再試一次。")
