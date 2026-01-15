@@ -8,81 +8,79 @@ import datetime
 st.set_page_config(page_title="夢想起飛：上市櫃全掃描", layout="wide")
 
 # --- 1. 爬蟲功能：抓取上市與上櫃熱門股 ---
-@st.cache_data(ttl=3600)  # 設定快取 1 小時，避免重複爬取變慢
+# --- 1. 爬蟲功能：改用 HiStock (結構較穩定) ---
+@st.cache_data(ttl=3600)
 def get_hot_stocks_from_web(limit=100):
     """
-    從 Yahoo 股市爬取上市與上櫃的成交量排行，並混合排序
+    從 HiStock 嗨投資爬取上市與上櫃的成交量排行
     """
     try:
-        # 定義目標網址 (Yahoo 股市排行榜)
-        urls = {
-            "上市": "https://tw.stock.yahoo.com/rank/volume?exchange=TAI",
-            "上櫃": "https://tw.stock.yahoo.com/rank/volume?exchange=TWO"
-        }
+        # 定義目標網址 (HiStock 的網址結構比較適合爬蟲)
+        # m=tw (上市), m=otc (上櫃)
+        sources = [
+            {"url": "https://histock.tw/stock/rank.aspx?m=tw", "suffix": ".TW", "market": "上市"},
+            {"url": "https://histock.tw/stock/rank.aspx?m=otc", "suffix": ".TWO", "market": "上櫃"}
+        ]
         
         all_stocks = []
 
-        for market_type, url in urls.items():
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers)
+        for source in sources:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            response = requests.get(source["url"], headers=headers)
+            # 強制設定編碼，避免亂碼
+            response.encoding = 'utf-8'
             
-            # 使用 pandas 直接解析 HTML 表格 (這招最快)
+            # 讀取表格
             dfs = pd.read_html(response.text)
             
-            # Yahoo 排行榜通常在第 2 個表格 (索引1) 或視情況而定
-            # 我們尋找包含 "股號" 或 "名稱" 的表格
-            target_df = None
-            for df in dfs:
-                if '股號/名稱' in df.columns or '名稱' in df.columns or df.shape[1] > 5:
-                    target_df = df
-                    break
-            
-            if target_df is not None:
-                # 整理資料
-                # 欄位通常是: [名次, 股號/名稱, 股價, 漲跌, ..., 成交量, ...]
-                # 我們只需要取出股號 (通常混在字串裡，如 "2330台積電")
+            # HiStock 的排行榜通常是頁面中的第一個表格
+            if dfs:
+                target_df = dfs[0]
                 
-                # 假設第一欄或第二欄包含股號
-                # Yahoo 格式通常是 "2330台積電"，我們切字串取前4碼
-                # 注意：有些 ETF 是 5 碼或 6 碼，這裡做簡單處理
-                
-                col_name = target_df.columns[1] # 假設是 "股號/名稱"
-                
-                for index, row in target_df.iterrows():
-                    raw_txt = str(row[col_name])
-                    # 取出前面的數字部分作為代號
-                    ticker = ''.join(filter(str.isdigit, raw_txt.split(' ')[0]))
-                    
-                    if not ticker: continue # 跳過無效資料
+                # 檢查欄位，確保有 '代號' 和 '成交量'
+                # HiStock 欄位通常是: 排名, 代號, 名稱, ..., 成交量
+                if '代號' in target_df.columns and '成交量' in target_df.columns:
+                    for index, row in target_df.iterrows():
+                        ticker = str(row['代號'])
+                        # 移除可能的特殊符號
+                        ticker = ''.join(filter(str.isdigit, ticker))
+                        
+                        if not ticker: continue
 
-                    # 判斷後綴
-                    suffix = ".TW" if market_type == "上市" else ".TWO"
-                    full_ticker = f"{ticker}{suffix}"
-                    
-                    # 嘗試抓取成交量 (需處理 '12,345' 這種格式)
-                    # 假設成交量在第 8 欄 (索引 7) 或類似位置，這邊用名稱對應比較保險
-                    vol_col = [c for c in target_df.columns if '張' in c or '量' in c]
-                    volume = 0
-                    if vol_col:
-                        vol_str = str(row[vol_col[0]]).replace(',', '')
-                        if vol_str.isdigit():
-                            volume = int(vol_str)
+                        full_ticker = f"{ticker}{source['suffix']}"
+                        
+                        # 處理成交量 (有些人可能用 k 或 m 表示，但 HiStock 通常是純數字或逗號)
+                        vol_raw = str(row['成交量'])
+                        # 移除非數字字符 (除了 .)
+                        try:
+                            volume = int(float(vol_raw.replace(',', '')))
+                        except:
+                            volume = 0
 
-                    all_stocks.append({
-                        "ticker": ticker,
-                        "full_ticker": full_ticker,
-                        "market": market_type,
-                        "volume": volume
-                    })
+                        all_stocks.append({
+                            "ticker": ticker,
+                            "full_ticker": full_ticker,
+                            "market": source['market'],
+                            "volume": volume
+                        })
 
-        # 將上市上櫃混合，依照成交量排序，取前 N 名
+        # 將上市上櫃混合，依照成交量排序
         df_all = pd.DataFrame(all_stocks)
+        
+        if df_all.empty:
+            return pd.DataFrame()
+
+        # 排序並取前 N 名
         df_all = df_all.sort_values(by="volume", ascending=False).head(limit)
         
         return df_all
         
     except Exception as e:
-        st.error(f"抓取熱門股清單失敗: {e}")
+        # 在 Streamlit 介面印出錯誤以便除錯
+        print(f"爬蟲錯誤: {e}") 
+        st.error(f"抓取資料發生錯誤，可能是來源網站阻擋: {e}")
         return pd.DataFrame()
 
 # --- 2. 策略邏輯 ---
@@ -223,4 +221,5 @@ if st.button("開始執行選股", type="primary"):
         )
     else:
         st.warning("🧐 掃描完畢，但沒有股票符合條件。")
+
         st.info("建議：嘗試關閉「嚴格模式」或增加「掃描熱門股數量」。")
