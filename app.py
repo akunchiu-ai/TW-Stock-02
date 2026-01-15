@@ -4,153 +4,101 @@ import yfinance as yf
 import requests
 
 # 設定頁面配置
-st.set_page_config(page_title="夢想起飛：全市場動態掃描", layout="wide")
+st.set_page_config(page_title="夢想起飛：全動態掃描", layout="wide")
 
 # ==========================================
-# 1. 第一步：取得全台所有上市櫃股票代號
-#    (來源：證交所與櫃買中心公開網頁)
+# 1. 第一步：從 Yahoo API 動態取得 "量大" 股票清單
+#    (包含：代號、名稱、即時成交量)
 # ==========================================
-@st.cache_data(ttl=86400)  # 快取 1 天，因為股票代號不會天天變
-def get_all_tw_ticker_list():
+@st.cache_data(ttl=600)  # 快取 10 分鐘
+def get_dynamic_top_stocks(total_limit=500):
     """
-    從證交所本國證券網頁抓取所有股票代號與名稱
+    不使用內建清單，而是向 Yahoo 請求上市與上櫃成交量最大的股票
     """
-    stock_list = []
+    # 我們分別抓取上市前 300 名和上櫃前 300 名，這樣加起來就有 600 檔候選股
+    # 足夠我們篩選出全市場成交量最大的 500 檔
+    fetch_limit = 300 
     
-    # 定義來源 URL (證交所公開資訊 - 本國上市/上櫃證券)
-    # Mode=2: 上市, Mode=4: 上櫃
-    urls = [
-        ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", ".TW", "上市"),
-        ("https://isin.twse.com.tw/isin/C_public.jsp?strMode=4", ".TWO", "上櫃")
+    api_urls = [
+        # 上市 (TAI)
+        {"market": "上市", "url": f"https://tw.stock.yahoo.com/_td-stock/api/resource/StockServices.rank;exchange=TAI;limit={fetch_limit};period=day;rankType=vol"},
+        # 上櫃 (TWO)
+        {"market": "上櫃", "url": f"https://tw.stock.yahoo.com/_td-stock/api/resource/StockServices.rank;exchange=TWO;limit={fetch_limit};period=day;rankType=vol"}
     ]
     
-    status_text = st.empty()
-    status_text.text("正在更新全台股票清單...")
+    all_candidates = []
+    
+    # 偽裝 Header (避免被擋)
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
+    }
 
     try:
-        for url, suffix, market in urls:
+        # 顯示狀態
+        status_text = st.empty()
+        status_text.text("正在連線 Yahoo 股市資料庫 (API)...")
+
+        for item in api_urls:
             try:
-                # 使用 requests 抓取網頁
-                res = requests.get(url)
-                # 使用 pandas 讀取 HTML 表格
-                dfs = pd.read_html(res.text)
-                
-                if len(dfs) > 0:
-                    df = dfs[0]
-                    # 資料整理：第一欄通常是 "有價證券代號及名稱"
-                    # 格式如 "2330 　台積電"
-                    df.columns = df.iloc[0] # 設定標頭
-                    df = df.iloc[1:]
+                response = requests.get(item["url"], headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    stock_list = data.get('list', [])
                     
-                    # 篩選出 "股票" 類別 (排除權證、債券等)
-                    # 證交所表格通常有 "ESVUFR" 或類似分類，我們簡單用代號長度判斷
-                    # 一般股票代號為 4 碼
-                    
-                    col_code_name = df.columns[0]
-                    
-                    for item in df[col_code_name]:
-                        item = str(item)
-                        # 分割代號與名稱
-                        parts = item.split()
-                        if len(parts) >= 2:
-                            code = parts[0]
-                            name = parts[1]
-                            
-                            # 只保留 4 位數代號 (排除 ETF、權證、特別股)
-                            if len(code) == 4 and code.isdigit():
-                                stock_list.append({
-                                    "ticker": code,
-                                    "full_ticker": f"{code}{suffix}",
-                                    "name": name,
-                                    "market": market
-                                })
+                    for stock in stock_list:
+                        symbol = stock.get('symbol', '')  # 格式如 "2330.TW"
+                        name = stock.get('name', '')      # 格式如 "台積電"
+                        price = stock.get('price', 0)
+                        
+                        # 成交量 (原始資料是股數，除以 1000 變張數)
+                        raw_vol = stock.get('volInStock', 0)
+                        vol_sheets = int(int(raw_vol) / 1000) if raw_vol else 0
+                        
+                        # 排除權證 (通常是 6 碼) 或其他非股票，這裡簡單篩選長度
+                        # 一般股票代號不含後綴通常是 4 碼
+                        ticker_code = symbol.split('.')[0]
+                        
+                        if len(ticker_code) == 4 and symbol:
+                            all_candidates.append({
+                                "ticker": ticker_code,
+                                "full_ticker": symbol,
+                                "name": name,
+                                "volume": vol_sheets,
+                                "price_now": price
+                            })
             except Exception as e:
-                print(f"Error parsing {market}: {e}")
+                print(f"API Fetch Error: {e}")
                 continue
-                
+
         status_text.empty()
-        return pd.DataFrame(stock_list)
+
+        if not all_candidates:
+            return pd.DataFrame()
+
+        # 轉成 DataFrame
+        df = pd.DataFrame(all_candidates)
         
+        # 混合上市上櫃後，依照「成交量」由大到小排序
+        df = df.sort_values(by="volume", ascending=False)
+        
+        # 取出使用者指定的前 N 大 (例如 500)
+        df_final = df.head(total_limit)
+        
+        return df_final
+
     except Exception as e:
-        status_text.empty()
-        st.error(f"無法取得股票清單: {e}")
+        st.error(f"連線失敗: {e}")
         return pd.DataFrame()
 
 # ==========================================
-# 2. 第二步：找出成交量最大的 500 檔
-# ==========================================
-@st.cache_data(ttl=1800) # 快取 30 分鐘
-def get_top_volume_stocks(limit=500):
-    
-    # 1. 取得全名單
-    df_all = get_all_tw_ticker_list()
-    if df_all.empty: return pd.DataFrame()
-    
-    all_tickers = df_all['full_ticker'].tolist()
-    
-    # 為了避免一次下載 1800 檔太久，我們分批下載，但 yfinance 批次很快，嘗試直接下
-    # 這裡只下載 "近 5 天" 的資料來算成交量，速度會很快
-    
-    st.toast(f"正在掃描全市場 {len(all_tickers)} 檔股票成交量...", icon="🚀")
-    
-    try:
-        # 批次下載 (Batch Download)
-        # threads=True 開啟多執行緒加速
-        data = yf.download(all_tickers, period="5d", group_by='ticker', progress=False, threads=True)
-        
-        volume_data = []
-        
-        for index, row in df_all.iterrows():
-            ticker = row['full_ticker']
-            name = row['name']
-            
-            try:
-                # 檢查是否有資料
-                if ticker not in data.columns.levels[0]: continue
-                
-                df_stock = data[ticker]
-                if df_stock.empty: continue
-                
-                # 取得平均成交量 (近5日) 或 最新成交量
-                # 這裡取最新一天的量
-                latest = df_stock.iloc[-1]
-                vol = latest['Volume']
-                price = latest['Close']
-                
-                if pd.isna(vol) or vol == 0: continue
-                
-                volume_data.append({
-                    "ticker": row['ticker'],
-                    "full_ticker": ticker,
-                    "name": name,
-                    "market": row['market'],
-                    "volume": int(vol),
-                    "price_now": float(price)
-                })
-            except:
-                continue
-                
-        # 轉成 DataFrame 並排序
-        df_vol = pd.DataFrame(volume_data)
-        if df_vol.empty: return pd.DataFrame()
-        
-        # 依成交量排序，取前 limit 名
-        df_top = df_vol.sort_values(by="volume", ascending=False).head(limit)
-        
-        return df_top
-        
-    except Exception as e:
-        st.error(f"成交量掃描失敗: {e}")
-        return pd.DataFrame()
-
-# ==========================================
-# 3. 第三步：策略邏輯 (針對 Top 500 進行詳細分析)
+# 2. 第二步：策略邏輯 (針對篩選出的熱門股進行分析)
 # ==========================================
 def check_dream_strategy(row_data, strict_mode=True):
     full_ticker = row_data['full_ticker']
     
     try:
-        # 下載歷史資料 (需 1 年以計算 MA200)
+        # 下載歷史資料 (yfinance)
+        # 需要約 1 年資料來計算 MA200 (年線)
         df = yf.download(full_ticker, period="1y", progress=False)
         
         if len(df) < 205: return None
@@ -194,9 +142,9 @@ def check_dream_strategy(row_data, strict_mode=True):
         if cond_bias and cond_ma200 and cond_vol:
             return {
                 "代號": row_data['ticker'],
-                "名稱": row_data['name'], # 這裡會顯示個股名稱
-                "現價": row_data['price_now'],
-                "成交量": row_data['volume'],
+                "名稱": row_data['name'], # 這裡有 API 抓到的名稱
+                "現價": row_data['price_now'], # API 抓到的即時價
+                "成交量": row_data['volume'], # API 抓到的即時量
                 "乖離率": f"{bias_val:.2f}%",
                 "趨勢": "🔥強勢" if strict_mode else "📈向上"
             }
@@ -206,42 +154,43 @@ def check_dream_strategy(row_data, strict_mode=True):
     return None
 
 # ==========================================
-# 4. UI 介面
+# 3. UI 介面
 # ==========================================
-st.title("🚀 夢想起飛：全市場動態篩選")
-st.markdown("### 資料來源：全台 1800+ 檔上市櫃股票動態掃描")
-st.caption("流程：1. 抓取所有股票代號 -> 2. yfinance 計算成交量 -> 3. 鎖定前 500 大 -> 4. 策略篩選")
+st.title("🚀 夢想起飛：全市場動態掃描")
+st.markdown("### 模式：全自動抓取市場最熱門股票")
+st.caption("來源：Yahoo 股市 API (上市+上櫃) -> 自動排序 -> 策略篩選")
 
 with st.sidebar:
     st.header("⚙️ 設定")
-    # 這裡改成鎖定前 500 大
+    # 讓使用者決定要分析前幾名，預設 300 比較快，最大 500
     scan_limit = st.slider("鎖定成交量前 N 大進行分析", 100, 500, 300) 
     strict_mode = st.checkbox("嚴格模式 (連續10日上升)", value=False)
-    st.info("💡 建議：先用 300 檔測試速度，若需要更廣範圍再開到 500。")
+    st.info("💡 建議：數量越多，計算時間越久 (300檔約需 1 分鐘)。")
 
-if st.button("開始掃描 (需耗時約 1-2 分鐘)", type="primary"):
+if st.button("開始掃描", type="primary"):
     
-    with st.status("正在啟動全市場掃描引擎...", expanded=True) as status:
+    with st.status("正在啟動掃描引擎...", expanded=True) as status:
         
-        # 步驟 1 & 2
-        st.write("📡 正在取得全台股票清單並計算成交量 (yfinance)...")
-        df_hot = get_top_volume_stocks(limit=scan_limit)
+        # 步驟 1: 從 API 抓清單
+        st.write(f"📡 正在從市場抓取成交量前 {scan_limit} 大股票 (含名稱)...")
+        
+        df_hot = get_dynamic_top_stocks(total_limit=scan_limit)
         
         if df_hot.empty:
-            status.update(label="❌ 數據取得失敗", state="error")
-            st.error("無法取得市場數據，請稍後再試。")
+            status.update(label="❌ 連線失敗", state="error")
+            st.error("無法連線至報價伺服器，請稍後再試。")
             st.stop()
             
-        st.write(f"✅ 已鎖定成交量最大的 {len(df_hot)} 檔熱門股 (如: {df_hot.iloc[0]['name']})，開始策略分析...")
+        st.write(f"✅ 成功鎖定 {len(df_hot)} 檔熱門股 (如: {df_hot.iloc[0]['name']})，開始技術分析...")
         
-        # 步驟 3
+        # 步驟 2: 進行策略運算
         results = []
         progress_bar = st.progress(0)
         
-        # 使用 enumerate 確保進度條正常
+        # 使用 enumerate 來確保進度條正確
         for i, (index, row) in enumerate(df_hot.iterrows()):
             
-            # 安全計算進度
+            # 計算進度
             progress_val = min((i + 1) / len(df_hot), 1.0)
             progress_bar.progress(progress_val)
             
@@ -251,22 +200,23 @@ if st.button("開始掃描 (需耗時約 1-2 分鐘)", type="primary"):
         
         status.update(label="全市場掃描完成！", state="complete", expanded=False)
 
-    # 步驟 4: 顯示結果
+    # 步驟 3: 顯示結果
     if results:
         final_df = pd.DataFrame(results)
+        # 依照成交量排序顯示
         final_df = final_df.sort_values(by="成交量", ascending=False)
         
-        st.success(f"🎉 從前 {scan_limit} 大熱門股中，篩選出 {len(final_df)} 檔符合條件！")
+        st.success(f"🎉 從前 {scan_limit} 大熱門股中，篩選出 {len(final_df)} 檔潛力股！")
         
         st.dataframe(
             final_df,
             column_config={
                 "現價": st.column_config.NumberColumn(format="$%.2f"),
-                "成交量": st.column_config.NumberColumn(format="%d 張"), # 顯示張數
+                "成交量": st.column_config.NumberColumn(format="%d 張"),
             },
             use_container_width=True,
             hide_index=True
         )
     else:
         st.warning("🧐 掃描完畢，沒有股票符合條件。")
-        st.markdown("**建議：** 你的策略非常嚴格，建議關閉「嚴格模式」或檢查目前市場是否處於回檔期。")
+        st.markdown("**建議：** 嘗試關閉「嚴格模式」或檢查是否因為盤勢不佳導致無人符合條件。")
